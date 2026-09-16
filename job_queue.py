@@ -1,27 +1,40 @@
 import redis
 import json
 import time
+from job import Job, JobStatus
 
 class JobQueue:
     STREAM = "jobs"
     GROUP = "workers"
-    DL_QUEUE = "jobs:dead"
-    MAX_RETRIES = 3
+    DL_STREAM = "jobs:dead"
+    MAX_ATTEMPS = 3
+    STATUS_PREFIX = "job-queue:status"
+    JOB_PREFIX = "job-queue:job"
 
     def __init__(self, redis_client: redis.Redis, consumer_name: str):
         self.redis = redis_client
         self.consumer = consumer_name
 
-    def enqueue(self, job_id, payload):
-        message_id = self.redis.xadd(
-            self.STREAM, 
-            {
-                "job_id": job_id,
-                "payload": json.dumps(payload),
-                "attempts": 0,
-            }
+    def enqueue(self, job):
+        self._save_job(job)
+
+        self.redis.sadd(
+            self._status_key(job.status), job.id
         )
-        print(f"Enqueued job={job_id}, message={message_id}")
+
+        message_id = self.redis.xadd(
+            self.STREAM, {"job_id": job.id }
+        )
+
+        print(f"Enqueued job={job.id}, message={message_id}")
+        return message_id
+
+    def get_job(self, job_id):
+        data = self.redis.get(self._job_key(job_id))
+        if not data:
+            return
+
+        return Job(**json.loads(data)) 
 
     def worker(self, process_job):
         # process_job is function that consumer want to process
@@ -42,10 +55,21 @@ class JobQueue:
 
     def _process_message(self, message_id, data, process_job):
         job_id = data["job_id"]
-        payload = json.loads(data["payload"])
+        job = self.get_job(job_id)
+
+        if not job:
+            print(f"Job {job_id} not found")
+            self.redis.xack(
+                self.STREAM, self.GROUP, message_id
+            )
+            return
+
+        self.update_status(job, JobStatus.PROCESSING)
 
         try:
-            process_job(job_id, payload)
+            process_job(job.id, job.payload)
+
+            self.update_status(job, JobStatus.COMPLETED)
 
             self.redis.xack(
                 self.STREAM, self.GROUP, message_id
@@ -55,19 +79,22 @@ class JobQueue:
         except Exception as e:
             print(f"Job {job_id} failed: {e}")
             self.retry_job(
-                job_id, payload, message_id, data, error=str(e),
+                job.id, message_id, error=str(e),
             )
 
-    def retry_job(self, job_id, payload, message_id, data, error=None):
-        attempts = int(data.get("attempts", 0)) + 1
+    def retry_job(self, job_id, message_id, error=None):
+        job = self.get_job(job_id)
+        print(job.attempts)
 
-        if attempts >= self.MAX_RETRIES:
+        attempts = job.attempts + 1
+
+        if attempts >= self.MAX_ATTEMPS:
             # Move to dead letter queue
             self.redis.xadd(
-                self.DL_QUEUE, 
+                self.DL_STREAM, 
                 {
                     "job_id": job_id,
-                    "payload": json.dumps(payload),
+                    "payload": job.to_json(),
                     "attempts": attempts,
                     "error": error or "max retries exceeded",
                 }
@@ -83,7 +110,7 @@ class JobQueue:
             self.STREAM, 
             {
                 "job_id": job_id,
-                "payload": json.dumps(payload),
+                "payload": job.to_json(),
                 "attempts": attempts,
             }
         )
@@ -123,4 +150,26 @@ class JobQueue:
         except redis.exceptions.ResponseError as e:
             if "BUSYGROUP" not in str(e):
                 raise
+
+    def update_status(self, job, new_status):
+        self.redis.srem(
+            self._status_key(job.status), job.id,
+        )
+        # Add to new status
+        self.redis.sadd(
+            self._status_key(new_status), job.id,
+        )
+        job.status = new_status
+        self._save_job(job)
+
+    def _job_key(self, job_id):
+        return f"{self.JOB_PREFIX}:{job_id}"
+
+    def _status_key(self, status):
+        return f"{self.STATUS_PREFIX}:{status}"
+
+    def _save_job(self, job):
+        self.redis.set(
+            self._job_key(job.id), job.to_json()
+        )
 
