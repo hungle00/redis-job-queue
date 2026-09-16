@@ -25,6 +25,7 @@ class JobQueue:
         message_id = self.redis.xadd(
             self.STREAM, {"job_id": job.id }
         )
+        self._update_status(job, JobStatus.QUEUED)
 
         print(f"Enqueued job={job.id}, message={message_id}")
         return message_id
@@ -64,12 +65,12 @@ class JobQueue:
             )
             return
 
-        self.update_status(job, JobStatus.PROCESSING)
+        self._update_status(job, JobStatus.PROCESSING)
 
         try:
             process_job(job.id, job.payload)
 
-            self.update_status(job, JobStatus.COMPLETED)
+            self._update_status(job, JobStatus.COMPLETED)
 
             self.redis.xack(
                 self.STREAM, self.GROUP, message_id
@@ -78,49 +79,60 @@ class JobQueue:
 
         except Exception as e:
             print(f"Job {job_id} failed: {e}")
+            self._update_status(job, JobStatus.RETRYING)
             self.retry_job(
                 job.id, message_id, error=str(e),
             )
 
     def retry_job(self, job_id, message_id, error=None):
         job = self.get_job(job_id)
-        print(job.attempts)
+        if not job:
+            print(f"Job {job_id} not found for retry")
+            return
 
         attempts = job.attempts + 1
+        job.attempts = attempts
+        job.error = error or "max retries exceeded"
 
         if attempts >= self.MAX_ATTEMPS:
-            # Move to dead letter queue
+            job.status = JobStatus.DEAD_LETTER
+            self._update_status(job, JobStatus.DEAD_LETTER)
+            self._save_job(job)
             self.redis.xadd(
-                self.DL_STREAM, 
+                self.DL_STREAM,
                 {
                     "job_id": job_id,
                     "payload": job.to_json(),
                     "attempts": attempts,
-                    "error": error or "max retries exceeded",
+                    "error": job.error,
                 }
             )
-            # Remove from PEL
-            self.redis.xack(
-                self.STREAM, self.GROUP, message_id
-            )
+            self.redis.xack(self.STREAM, self.GROUP, message_id)
             print(f"Job {job_id} moved to DLQ")
             return
 
+        job.status = JobStatus.RETRYING
+        self._save_job(job)
         self.redis.xadd(
-            self.STREAM, 
+            self.STREAM,
             {
                 "job_id": job_id,
                 "payload": job.to_json(),
                 "attempts": attempts,
             }
         )
-        # ACK the old message
-        self.redis.xack(
-            self.STREAM, self.GROUP, message_id,
-        )
+        self.redis.xack(self.STREAM, self.GROUP, message_id)
 
         print(f"Retry job={job_id}, attempt={attempts}")
 
+    def get_jobs_by_status(self, status):
+        ids = self.redis.smembers(self._status_key(status))
+        jobs = []
+        for job_id in ids:
+            job = self.get_job(job_id)
+            if job is not None:
+                jobs.append(job)
+        return jobs
 
     def reclaim_stale(self, process_job, min_idle_time=10000):
         """
@@ -151,11 +163,10 @@ class JobQueue:
             if "BUSYGROUP" not in str(e):
                 raise
 
-    def update_status(self, job, new_status):
+    def _update_status(self, job, new_status):
         self.redis.srem(
             self._status_key(job.status), job.id,
         )
-        # Add to new status
         self.redis.sadd(
             self._status_key(new_status), job.id,
         )
