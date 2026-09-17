@@ -1,6 +1,6 @@
 import redis
 import json
-import time
+import uuid
 from job import Job, JobStatus
 
 class JobQueue:
@@ -15,7 +15,8 @@ class JobQueue:
         self.redis = redis_client
         self.consumer = consumer_name
 
-    def enqueue(self, job):
+    def enqueue(self, payload):
+        job = self._new_job(payload)
         self._save_job(job)
 
         self.redis.sadd(
@@ -154,6 +155,12 @@ class JobQueue:
             print(f"Processing {message_id}")
             self._process_message(message_id, data, process_job)
 
+    def _new_job(self, payload):
+        return Job(
+            id=str(uuid.uuid4()),
+            payload=payload,
+        )
+
     def _create_consumer_group(self):
         try:
             self.redis.xgroup_create(
@@ -164,8 +171,9 @@ class JobQueue:
                 raise
 
     def _update_status(self, job, new_status):
+        old_status = job.status
         self.redis.srem(
-            self._status_key(job.status), job.id,
+            self._status_key(old_status), job.id,
         )
         self.redis.sadd(
             self._status_key(new_status), job.id,

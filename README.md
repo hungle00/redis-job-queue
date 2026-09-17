@@ -1,30 +1,36 @@
-# Redis Streams Queue
+# Redis Job Queue
 A simple job queue implemented with Python and Redis Streams.
 
 ## Overall Flow
 ```
 producer.py
-  │
-  │ enqueue()
-  ▼
-JobQueue
-  │
-  ▼
-Redis
-  │
-  │
-  ├──────────────► worker.py
-                     │
-                     └── process message
-                     │
-                     ├── retry
-                     └── dead-letter queue
+    │
+    │ enqueue()
+    ▼
+ JobQueue
+    │
+    ▼
+  Redis
+    │
+    │ XREADGROUP
+    ▼
+ worker.py
+    │
+    ├── process job
+    ├── retry on failure
+    ├── reclaim stale jobs
+    └── dead-letter queue
 ```
 
 The main idea is to keep the responsibilities separated:
-- `producer.py` → enqueue job
-- `job_queue.py` → queue abstraction
-- `worker.py` → process jobs
+- `producer.py` → create and enqueue jobs
+- `job_queue.py` → queue abstraction, retry, recovery and DLQ
+- `worker.py` → consume and process jobs
+
+## Redis Data Model
+- Stream → job queue and dead-letter queue
+- String → store job data
+- Set → index jobs by status
 
 ## Run Redis on Docker
 
