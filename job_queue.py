@@ -1,6 +1,7 @@
 import redis
 import json
 import uuid
+import cloudpickle
 from job import Job, JobStatus
 
 class JobQueue:
@@ -15,8 +16,14 @@ class JobQueue:
         self.redis = redis_client
         self.consumer = consumer_name
 
-    def enqueue(self, payload):
-        job = self._new_job(payload)
+    def enqueue(self, func, *args, **kwargs):
+        payload_data = {
+            "func": func,
+            "args": args,
+            "kwargs": kwargs
+        }
+
+        job = self._new_job(payload_data)
         self._save_job(job)
 
         self.redis.sadd(
@@ -29,17 +36,16 @@ class JobQueue:
         self._update_status(job, JobStatus.QUEUED)
 
         print(f"Enqueued job={job.id}, message={message_id}")
-        return message_id
+        return job.id
 
     def get_job(self, job_id):
         data = self.redis.get(self._job_key(job_id))
         if not data:
             return
 
-        return Job(**json.loads(data)) 
+        return Job.deserialize(data)
 
-    def worker(self, process_job):
-        # process_job is function that consumer want to process
+    def process(self):
         self._create_consumer_group()
 
         while(True):
@@ -53,26 +59,27 @@ class JobQueue:
 
             for _, entries in messages:
                 for message_id, data in entries:
-                    self._process_message(message_id, data, process_job)
+                    self._process_message(message_id, data)
 
-    def _process_message(self, message_id, data, process_job):
+
+    def _process_message(self, message_id, data):
         job_id = data["job_id"]
         job = self.get_job(job_id)
 
         if not job:
             print(f"Job {job_id} not found")
-            self.redis.xack(
-                self.STREAM, self.GROUP, message_id
-            )
+            self.redis.xack(self.STREAM, self.GROUP, message_id)
             return
 
         self._update_status(job, JobStatus.PROCESSING)
 
         try:
-            process_job(job.id, job.payload)
+            # unpack func, args, kwargs to execute
+            func, args, kwargs = job.unpack_payload()
+            res = func(*args, **kwargs)
+            print(res)
 
             self._update_status(job, JobStatus.COMPLETED)
-
             self.redis.xack(
                 self.STREAM, self.GROUP, message_id
             )
@@ -189,6 +196,6 @@ class JobQueue:
 
     def _save_job(self, job):
         self.redis.set(
-            self._job_key(job.id), job.to_json()
+            self._job_key(job.id), job.serialize()
         )
 
