@@ -4,7 +4,7 @@ import time
 from job_queue import JobQueue
 
 r = redis.Redis(host="localhost", port=6379, decode_responses=True)
-jqueue = JobQueue(redis_client=r, consumer_name="mailer")
+jqueue = JobQueue(redis_client=r)
 
 def send_email(data):
     # actual email logic

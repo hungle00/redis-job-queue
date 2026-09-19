@@ -12,9 +12,9 @@ class JobQueue:
     STATUS_PREFIX = "job-queue:status"
     JOB_PREFIX = "job-queue:job"
 
-    def __init__(self, redis_client: redis.Redis, consumer_name: str):
+    def __init__(self, redis_client: redis.Redis):
         self.redis = redis_client
-        self.consumer = consumer_name
+        self._create_consumer_group()
 
     def enqueue(self, func, *args, **kwargs):
         payload_data = {
@@ -26,14 +26,12 @@ class JobQueue:
         job = self._new_job(payload_data)
         self._save_job(job)
 
-        self.redis.sadd(
-            self._status_key(job.status), job.id
-        )
+        self.redis.sadd(self._status_key(job.status), job.id)
 
         message_id = self.redis.xadd(
             self.STREAM, {"job_id": job.id }
         )
-        self._update_status(job, JobStatus.QUEUED)
+        self.update_status(job, JobStatus.QUEUED)
 
         print(f"Enqueued job={job.id}, message={message_id}")
         return job.id
@@ -45,93 +43,58 @@ class JobQueue:
 
         return Job.deserialize(data)
 
-    def process(self):
-        self._create_consumer_group()
-
+    def fetch_jobs(self, consumer_name: str, count: int = 1, block_ms: int = 2000):
+        """
+        Read messages from Redis Stream.
+        Return list of tuple: [(message_id, job_id), ...]
+        """
         while(True):
             messages = self.redis.xreadgroup(
-                self.GROUP, self.consumer, {self.STREAM: '>'}, count=1, block=5000
+                self.GROUP, consumer_name, 
+                {self.STREAM: '>'}, count=count, block=block_ms
             )
 
             if not messages:
                 print("No new messages. Waiting...")
-                continue
+                return []
 
+            parsed_jobs = []
             for _, entries in messages:
                 for message_id, data in entries:
-                    self._process_message(message_id, data)
+                    parsed_jobs.append((message_id, data["job_id"]))
 
+            return parsed_jobs
 
-    def _process_message(self, message_id, data):
-        job_id = data["job_id"]
-        job = self.get_job(job_id)
-
-        if not job:
-            print(f"Job {job_id} not found")
-            self.redis.xack(self.STREAM, self.GROUP, message_id)
-            return
-
-        self._update_status(job, JobStatus.PROCESSING)
-
-        try:
-            # unpack func, args, kwargs to execute
-            func, args, kwargs = job.unpack_payload()
-            res = func(*args, **kwargs)
-            print(res)
-
-            self._update_status(job, JobStatus.COMPLETED)
-            self.redis.xack(
-                self.STREAM, self.GROUP, message_id
-            )
-            print(f"ACK job={job_id} with message={message_id}")
-
-        except Exception as e:
-            print(f"Job {job_id} failed: {e}")
-            self._update_status(job, JobStatus.RETRYING)
-            self.retry_job(
-                job.id, message_id, error=str(e),
-            )
-
-    def retry_job(self, job_id, message_id, error=None):
-        job = self.get_job(job_id)
-        if not job:
-            print(f"Job {job_id} not found for retry")
-            return
-
+    def retry_job(self, job, message_id, error=None):
         attempts = job.attempts + 1
         job.attempts = attempts
         job.error = error or "max retries exceeded"
 
         if attempts >= self.MAX_ATTEMPS:
             job.status = JobStatus.DEAD_LETTER
-            self._update_status(job, JobStatus.DEAD_LETTER)
             self._save_job(job)
+            self.update_status(job, JobStatus.DEAD_LETTER)
             self.redis.xadd(
                 self.DL_STREAM,
                 {
-                    "job_id": job_id,
-                    "payload": job.to_json(),
+                    "job_id": job.id,
                     "attempts": attempts,
                     "error": job.error,
                 }
             )
-            self.redis.xack(self.STREAM, self.GROUP, message_id)
-            print(f"Job {job_id} moved to DLQ")
+            self.ack(message_id)
+            print(f"Job {job.id} moved to DLQ")
             return
 
         job.status = JobStatus.RETRYING
         self._save_job(job)
+        self.update_status(job, JobStatus.RETRYING)
         self.redis.xadd(
-            self.STREAM,
-            {
-                "job_id": job_id,
-                "payload": job.to_json(),
-                "attempts": attempts,
-            }
+            self.STREAM, {"job_id": job.id }
         )
-        self.redis.xack(self.STREAM, self.GROUP, message_id)
+        self.ack(message_id)
 
-        print(f"Retry job={job_id}, attempt={attempts}")
+        print(f"Retry job={job.id}, attempt={attempts}")
 
     def get_jobs_by_status(self, status):
         ids = self.redis.smembers(self._status_key(status))
@@ -142,13 +105,13 @@ class JobQueue:
                 jobs.append(job)
         return jobs
 
-    def reclaim_stale(self, process_job, min_idle_time=10000):
+    def reclaim_stale(self, consumer_name: str, min_idle_time=10000):
         """
         Reclaim messages that have been pending
         for longer than min_idle_time milliseconds.
         """
         result = self.redis.xautoclaim(
-            self.STREAM, self.GROUP, self.consumer, 
+            self.STREAM, self.GROUP, consumer_name,
             min_idle_time, "0-0", count=10,
         )
         next_id, messages = result[0], result[1]
@@ -160,7 +123,22 @@ class JobQueue:
 
         for message_id, data in messages:
             print(f"Processing {message_id}")
-            self._process_message(message_id, data, process_job)
+            # self._process_message(message_id, data, process_job)
+   
+    def ack(self, message_id: str):
+        """Acknowledge that the worker has finished processing a message."""
+        self.redis.xack(self.STREAM, self.GROUP, message_id)
+
+    def update_status(self, job, new_status):
+        old_status = job.status
+        self.redis.srem(
+            self._status_key(old_status), job.id,
+        )
+        self.redis.sadd(
+            self._status_key(new_status), job.id,
+        )
+        job.status = new_status
+        self._save_job(job)
 
     def _new_job(self, payload):
         return Job(
@@ -176,17 +154,6 @@ class JobQueue:
         except redis.exceptions.ResponseError as e:
             if "BUSYGROUP" not in str(e):
                 raise
-
-    def _update_status(self, job, new_status):
-        old_status = job.status
-        self.redis.srem(
-            self._status_key(old_status), job.id,
-        )
-        self.redis.sadd(
-            self._status_key(new_status), job.id,
-        )
-        job.status = new_status
-        self._save_job(job)
 
     def _job_key(self, job_id):
         return f"{self.JOB_PREFIX}:{job_id}"
