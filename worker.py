@@ -1,6 +1,7 @@
 import os
 import signal
 import redis
+import time
 from job_queue import JobQueue, JobStatus
 
 class Worker:
@@ -19,9 +20,16 @@ class Worker:
 
     def start(self):
         print(f"[Worker '{self.consumer}'] Start listening stream '{self.queue.STREAM}'...")
-        
+        last_scheduler_check = 0
+
         while self.is_running:
             try:
+                now = time.time()
+                # fetch scheduled delays job
+                if now - last_scheduler_check > 3:
+                    self.queue.enqueue_scheduled_jobs()
+                    last_scheduler_check = now
+
                 jobs_to_process = self.queue.fetch_jobs(
                     self.consumer, count=1, block_ms=2000
                 )
@@ -30,7 +38,7 @@ class Worker:
 
             except redis.ConnectionError:
                 print("[Worker] Lost connection to Redis. Retrying in 5 seconds...")
-                import time; time.sleep(5)
+                time.sleep(5)
             except KeyboardInterrupt:
                 # Handle Ctrl+C if it arrives while xreadgroup is blocking.
                 self._handle_shutdown(None, None)

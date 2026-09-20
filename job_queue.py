@@ -2,6 +2,7 @@ import redis
 import json
 import uuid
 import cloudpickle
+import time
 from job import Job, JobStatus
 
 class JobQueue:
@@ -11,6 +12,7 @@ class JobQueue:
     MAX_ATTEMPS = 3
     STATUS_PREFIX = "job-queue:status"
     JOB_PREFIX = "job-queue:job"
+    DELAYED_KEY = "job-queue:delayed"
 
     def __init__(self, redis_client: redis.Redis):
         self.redis = redis_client
@@ -65,7 +67,7 @@ class JobQueue:
 
             return parsed_jobs
 
-    def retry_job(self, job, message_id, error=None):
+    def retry_job(self, job, message_id, error=None, base_delay=10):
         attempts = job.attempts + 1
         job.attempts = attempts
         job.error = error or "max retries exceeded"
@@ -86,15 +88,35 @@ class JobQueue:
             print(f"Job {job.id} moved to DLQ")
             return
 
+        # Delayed retry using exponential backoff
+        delay_seconds = base_delay * (2 ** (attempts - 1))
+        execute_at = time.time() + delay_seconds
+
         job.status = JobStatus.RETRYING
         self._save_job(job)
         self.update_status(job, JobStatus.RETRYING)
-        self.redis.xadd(
-            self.STREAM, {"job_id": job.id }
+        # Saving delayed job into Redis ZSET.
+        self.redis.zadd(
+            self.DELAYED_KEY, {job.id: execute_at}
         )
         self.ack(message_id)
 
         print(f"Retry job={job.id}, attempt={attempts}")
+
+    def enqueue_scheduled_jobs(self):
+        now = time.time()
+        ready_jobs = self.redis.zrangebyscore(self.DELAYED_KEY, 0, now)
+        print(ready_jobs)
+        if not ready_jobs:
+            return 0
+
+        p = self.redis.pipeline()
+        for job_id in ready_jobs:
+            p.xadd(self.STREAM, {"job_id": job_id})
+            p.zrem(self.DELAYED_KEY, job_id)
+        
+        p.execute()
+        return len(ready_jobs)
 
     def get_jobs_by_status(self, status):
         ids = self.redis.smembers(self._status_key(status))

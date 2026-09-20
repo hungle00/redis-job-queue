@@ -1,36 +1,43 @@
 # Redis Job Queue
-A simple job queue implemented with Python and Redis Streams.
+A lightweight, reliable job queue implemented in Python using Redis Streams, Hash/KV, and Sorted Sets.
+
+Modelled with a strong separation of concerns:
+- **`JobQueue`**: Manages data persistence, status indexing, retry logic, and Redis communication.
+- **`Worker`**: Serves as a pure execution engine handling process isolation, graceful shutdowns, signal handling, and retry/reclaim triggers
 
 ## Overall Flow
 ```
+```text
 producer.py
     │
-    │ enqueue()
+    │ queue.enqueue()
     ▼
  JobQueue
     │
     ▼
-  Redis
-    │
-    │ XREADGROUP
-    ▼
- worker.py
-    │
-    ├── process job
-    ├── retry on failure
-    ├── reclaim stale jobs
-    └── dead-letter queue
+  Redis ─── [ Stream: jobs ]
+               │
+               │ fetch_jobs() / XREADGROUP
+               ▼
+           worker.py
+               │
+               ├── process job (via os.fork)
+               │     ├── Success ──► queue.ack() ──► update_status('completed')
+               │     └── Failure ──► queue.retry_job()
+               │                         ├── Exceeds MAX_ATTEMPTS ──► [ DLQ Stream: jobs:dead ]
+               │                         └── Backoff Delay ────────► [ ZSET: job-queue:delayed ]
+               │                                                            │
+               │   
+               │   ▼ (periodic enqueue_scheduled_jobs)
+               ├── 
+               └── Promote delayed jobs back to Stream
 ```
 
-The main idea is to keep the responsibilities separated:
-- `producer.py` → create and enqueue jobs
-- `job_queue.py` → queue abstraction, retry, recovery and DLQ
-- `worker.py` → consume and process jobs
-
 ## Redis Data Model
-- Stream → job queue and dead-letter queue
-- String → store job data
-- Set → index jobs by status
+- Stream → Main queue for job processing and dead-letter queue
+- String → Stores full job metadata, payload, attempt counts, errors,... as JSON.
+- Set → Indexes job IDs by their current lifecycle state (queued, processing, completed, retrying, dead_letter).
+- Sorted Set → Manages exponential backoff retries using Unix timestamps as scores.
 
 ## Run Redis on Docker
 
