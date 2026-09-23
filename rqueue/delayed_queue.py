@@ -30,3 +30,6 @@ class DelayedQueue:
 
     def count(self) -> int:
         return self.redis.zcard(self.KEY)
+
+    def get_all_members(self) -> list:
+        return self.redis.zrange(self.KEY, 0, -1, withscores=True)

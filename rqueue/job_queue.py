@@ -1,24 +1,22 @@
 import redis
-import json
 import uuid
-import cloudpickle
 import time
 from datetime import datetime
 from rqueue.job import Job, JobStatus
 from rqueue.delayed_queue import DelayedQueue
+from rqueue.dead_letter_queue import DeadLetterQueue
 
 class JobQueue:
     STREAM = "jobs"
     GROUP = "workers"
-    DL_STREAM = "jobs:dead"
     MAX_ATTEMPS = 3
     STATUS_PREFIX = "job-queue:status"
     JOB_PREFIX = "job-queue:job"
-    DELAYED_KEY = DelayedQueue.KEY
 
     def __init__(self, redis_client: redis.Redis):
         self.redis = redis_client
         self.delayed_queue = DelayedQueue(redis_client)
+        self.dead_letter_queue = DeadLetterQueue(redis_client)
         self._create_consumer_group()
 
     def enqueue(self, func, *args, **kwargs):
@@ -92,14 +90,7 @@ class JobQueue:
             job.status = JobStatus.DEAD_LETTER
             self._save_job(job)
             self.update_status(job, JobStatus.DEAD_LETTER)
-            self.redis.xadd(
-                self.DL_STREAM,
-                {
-                    "job_id": job.id,
-                    "attempts": attempts,
-                    "error": job.error,
-                }
-            )
+            self.dead_letter_queue.push(job.id, job.error, attempts)
             self.ack(message_id)
             print(f"Job {job.id} moved to DLQ")
             return
@@ -156,16 +147,13 @@ class JobQueue:
             self.STREAM, self.GROUP, consumer_name,
             min_idle_time, "0-0", count=10,
         )
-        next_id, messages = result[0], result[1]
+        _, messages = result[0], result[1]
 
         if not messages:
-            return
+            return []
 
         print(f"Reclaimed {len(messages)} stale messages")
-
-        for message_id, data in messages:
-            print(f"Processing {message_id}")
-            # self._process_message(message_id, data, process_job)
+        return [(message_id, data["job_id"]) for message_id, data in messages]
    
     def ack(self, message_id: str):
         """Acknowledge that the worker has finished processing a message."""

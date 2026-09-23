@@ -21,6 +21,7 @@ class Worker:
     def start(self):
         print(f"[Worker '{self.consumer}'] Start listening stream '{self.queue.STREAM}'...")
         last_scheduler_check = 0
+        last_reclaim_check = 0
 
         while self.is_running:
             try:
@@ -29,6 +30,11 @@ class Worker:
                 if now - last_scheduler_check > 5:
                     self.queue.enqueue_scheduled_jobs()
                     last_scheduler_check = now
+
+                # 2. Reclaim stale/pending jobs from dead workers
+                if now - last_reclaim_check > 30:
+                    self._check_stale_jobs()
+                    last_reclaim_check = now
 
                 jobs_to_process = self.queue.fetch_jobs(
                     self.consumer, count=1, block_ms=2000
@@ -44,6 +50,13 @@ class Worker:
                 self._handle_shutdown(None, None)
                 break
 
+    def _check_stale_jobs(self):
+        stale_jobs = self.queue.reclaim_stale(self.consumer, min_idle_time=30000)
+            
+        for msg_id, job_id in stale_jobs:
+            print(f"[Worker '{self.consumer}'] Reclaimed stale job: {job_id}")
+            self._process_message(msg_id, job_id)
+    
     def _process_message(self, message_id: str, job_id: str):
         job = self.queue.get_job(job_id)
 
