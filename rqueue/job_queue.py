@@ -3,7 +3,9 @@ import json
 import uuid
 import cloudpickle
 import time
-from job import Job, JobStatus
+from datetime import datetime
+from rqueue.job import Job, JobStatus
+from rqueue.delayed_queue import DelayedQueue
 
 class JobQueue:
     STREAM = "jobs"
@@ -12,20 +14,15 @@ class JobQueue:
     MAX_ATTEMPS = 3
     STATUS_PREFIX = "job-queue:status"
     JOB_PREFIX = "job-queue:job"
-    DELAYED_KEY = "job-queue:delayed"
+    DELAYED_KEY = DelayedQueue.KEY
 
     def __init__(self, redis_client: redis.Redis):
         self.redis = redis_client
+        self.delayed_queue = DelayedQueue(redis_client)
         self._create_consumer_group()
 
     def enqueue(self, func, *args, **kwargs):
-        payload_data = {
-            "func": func,
-            "args": args,
-            "kwargs": kwargs
-        }
-
-        job = self._new_job(payload_data)
+        job = self._new_job(func, *args, **kwargs)
         self._save_job(job)
 
         self.redis.sadd(self._status_key(job.status), job.id)
@@ -36,6 +33,25 @@ class JobQueue:
         self.update_status(job, JobStatus.QUEUED)
 
         print(f"Enqueued job={job.id}, message={message_id}")
+        return job.id
+
+    def enqueue_at(self, time_to_execute, func, *args, **kwargs):
+        if isinstance(time_to_execute, datetime):
+            execute_timestamp = time_to_execute.timestamp()
+        else:
+            execute_timestamp = float(time_to_execute)
+
+        now = time.time()
+        if execute_timestamp <= now:
+            return self.enqueue(func, *args, **kwargs)
+
+        job = self._new_job(func, *args, **kwargs)
+        job.status = JobStatus.SCHEDULED
+        self._save_job(job)
+        self.redis.sadd(self._status_key(JobStatus.SCHEDULED), job.id)
+        self.delayed_queue.push(job.id, execute_timestamp)
+
+        print(f"Job {job.id} will be execute at {execute_timestamp}")
         return job.id
 
     def get_job(self, job_id):
@@ -96,25 +112,29 @@ class JobQueue:
         self._save_job(job)
         self.update_status(job, JobStatus.RETRYING)
         # Saving delayed job into Redis ZSET.
-        self.redis.zadd(
-            self.DELAYED_KEY, {job.id: execute_at}
-        )
+        self.delayed_queue.push(job.id, execute_at)
         self.ack(message_id)
 
         print(f"Retry job={job.id}, attempt={attempts}")
 
     def enqueue_scheduled_jobs(self):
-        now = time.time()
-        ready_jobs = self.redis.zrangebyscore(self.DELAYED_KEY, 0, now)
-        print(ready_jobs)
+        ready_jobs = self.delayed_queue.pop_ready_jobs()
         if not ready_jobs:
             return 0
 
         p = self.redis.pipeline()
         for job_id in ready_jobs:
+            job = self.get_job(job_id)
+            if job is None:
+                continue
+
+            job.status = JobStatus.QUEUED
+            self._save_job(job)
+            self.redis.srem(self._status_key(JobStatus.SCHEDULED), job_id)
+            self.redis.sadd(self._status_key(JobStatus.QUEUED), job_id)
+
             p.xadd(self.STREAM, {"job_id": job_id})
-            p.zrem(self.DELAYED_KEY, job_id)
-        
+
         p.execute()
         return len(ready_jobs)
 
@@ -162,11 +182,14 @@ class JobQueue:
         job.status = new_status
         self._save_job(job)
 
-    def _new_job(self, payload):
-        return Job(
-            id=str(uuid.uuid4()),
-            payload=payload,
-        )
+    def _new_job(self, func, *args, **kwargs):
+        payload_data = {
+            "func": func,
+            "args": args,
+            "kwargs": kwargs
+        }
+        job = Job(id=str(uuid.uuid4()), payload=payload_data)
+        return job
 
     def _create_consumer_group(self):
         try:

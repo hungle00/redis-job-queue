@@ -2,7 +2,7 @@ import os
 import signal
 import redis
 import time
-from job_queue import JobQueue, JobStatus
+from rqueue.job_queue import JobQueue, JobStatus
 
 class Worker:
     def __init__(self, queue: JobQueue, consumer_name: str):
@@ -26,7 +26,7 @@ class Worker:
             try:
                 now = time.time()
                 # fetch scheduled delays job
-                if now - last_scheduler_check > 3:
+                if now - last_scheduler_check > 5:
                     self.queue.enqueue_scheduled_jobs()
                     last_scheduler_check = now
 

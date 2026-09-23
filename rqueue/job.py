@@ -5,6 +5,7 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 class JobStatus:
+    SCHEDULED = "scheduled"
     QUEUED = "queued"
     PROCESSING = "processing"
     COMPLETED = "completed"
