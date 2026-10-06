@@ -10,7 +10,7 @@ jqueue = JobQueue(redis_client=r)
 def send_email(data):
     # actual email logic
     # email_service.send(...)
-    time.sleep(1)
+    time.sleep(2)
     print(f"Sending email to {data['to']}")
     print(f"Subject: {data['subject']}")
 
@@ -24,8 +24,10 @@ if __name__ == "__main__":
         "subject": "Welcome!",
         "body": "Welcome to our application!",
     }
-    # Enqueue normal function
-    jqueue.enqueue(send_email, user_data)
+    # Test for handling concurrent jobs
+    for i in range(1, 10):
+        user_data["to"] = f"user{i}@example.com"
+        jqueue.enqueue(send_email, user_data)
 
     run_time = datetime.now() + timedelta(minutes=2)
     job_3 = jqueue.enqueue_at(run_time, user_data)

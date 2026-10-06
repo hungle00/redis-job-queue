@@ -2,13 +2,16 @@ import os
 import signal
 import redis
 import time
+from concurrent.futures import ThreadPoolExecutor
 from rqueue.job_queue import JobQueue, JobStatus
 
 class Worker:
-    def __init__(self, queue: JobQueue, consumer_name: str):
+    def __init__(self, queue: JobQueue, consumer_name: str, max_threads: int = 5):
         self.queue = queue
         self.consumer = consumer_name
         self.is_running = True
+        self.max_threads = max_threads
+        self.executor = ThreadPoolExecutor(max_workers=max_threads, thread_name_prefix="JobWorker")
 
         # Register signal handlers for graceful shutdown.
         signal.signal(signal.SIGINT, self._handle_shutdown)
@@ -17,6 +20,7 @@ class Worker:
     def _handle_shutdown(self, signum, frame):
         print(f"\n[Worker '{self.consumer}'] Shutdown signal received. Exiting gracefully...")
         self.is_running = False
+        self.executor.shutdown(wait=True)
 
     def start(self):
         print(f"[Worker '{self.consumer}'] Start listening stream '{self.queue.STREAM}'...")
@@ -37,10 +41,10 @@ class Worker:
                     last_reclaim_check = now
 
                 jobs_to_process = self.queue.fetch_jobs(
-                    self.consumer, count=1, block_ms=2000
+                    self.consumer, count=self.max_threads, block_ms=2000
                 )
                 for msg_id, job_id in jobs_to_process:
-                    self._process_message(msg_id, job_id)
+                    self.executor.submit(self._process_message, msg_id, job_id)
 
             except redis.ConnectionError:
                 print("[Worker] Lost connection to Redis. Retrying in 5 seconds...")
