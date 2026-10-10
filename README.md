@@ -5,25 +5,39 @@ Modelled with a strong separation of concerns:
 - **`JobQueue`**: Manages data persistence, status indexing, retry logic, and Redis communication.
 - **`Worker`**: Serves as a pure execution engine handling process isolation, graceful shutdowns, signal handling, and retry/reclaim triggers
 
+This project is inspired by the [RQ](https://python-rq.org/) - famous Python Task queue library.
+
 ## How to use
 
-Install the dependencies and start Redis:
+Install the CLI in editable mode and start Redis:
 
 ```bash
-pip install -r requirements.txt
+pip install -e .
 docker compose up -d
 ```
 
 In one terminal, start a worker listening to the default and `emails` queues:
 
 ```bash
-python rqueue.py worker --queues default,emails --name local-worker --threads 5
+rqueue worker --queues default,emails --name local-worker --threads 5
 ```
 
-Or default command will be:
+The default worker command listens to the `default` queue:
+
 ```bash
-python rqueue.py worker 
+rqueue worker
 ```
+
+Use these commands to inspect queue state and jobs:
+
+```bash
+rqueue list --status processing
+rqueue job inspect <job-id>
+rqueue failed list
+rqueue delayed list
+```
+
+The `failed` and `delayed` lists accept an optional `--limit` value, for example `rqueue failed list --limit 10`.
 
 In your producer application, enqueue work on the default queue or choose a named queue explicitly:
 
@@ -42,7 +56,7 @@ jobs.enqueue(send_email, data)  # default queue
 jobs.enqueue_to("emails", send_email, data)
 ```
 
-Run that producer code in another terminal, for example with `python producer.py`. To schedule work for later, use `enqueue_at` for the default queue or `enqueue_at_to` for a named queue:
+Run the producer code in another terminal. To schedule work for later, use `enqueue_at` for the default queue or `enqueue_at_to` for a named queue:
 
 ```python
 from datetime import datetime, timedelta
