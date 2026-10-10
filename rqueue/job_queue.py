@@ -9,6 +9,7 @@ from rqueue.dead_letter_queue import DeadLetterQueue
 class JobQueue:
     STREAM = "jobs"
     GROUP = "workers"
+    DEFAULT_QUEUE = "default"
     MAX_ATTEMPS = 3
     STATUS_PREFIX = "job-queue:status"
     JOB_PREFIX = "job-queue:job"
@@ -17,23 +18,31 @@ class JobQueue:
         self.redis = redis_client
         self.delayed_queue = DelayedQueue(redis_client)
         self.dead_letter_queue = DeadLetterQueue(redis_client)
-        self._create_consumer_group()
+        self._create_consumer_group(self.DEFAULT_QUEUE)
 
     def enqueue(self, func, *args, **kwargs):
-        job = self._new_job(func, *args, **kwargs)
+        return self.enqueue_to(self.DEFAULT_QUEUE, func, *args, **kwargs)
+
+    def enqueue_to(self, queue_name, /, func, *args, **kwargs):
+        job = self._new_job(queue_name, func, *args, **kwargs)
         self._save_job(job)
 
         self.redis.sadd(self._status_key(job.status), job.id)
 
         message_id = self.redis.xadd(
-            self.STREAM, {"job_id": job.id }
+            self._stream_for_queue(queue_name), {"job_id": job.id }
         )
         self.update_status(job, JobStatus.QUEUED)
 
-        print(f"Enqueued job={job.id}, message={message_id}")
+        print(f"Enqueued job={job.id}, queue={queue_name}, message={message_id}")
         return job.id
 
     def enqueue_at(self, time_to_execute, func, *args, **kwargs):
+        return self.enqueue_at_to(
+            self.DEFAULT_QUEUE, time_to_execute, func, *args, **kwargs
+        )
+
+    def enqueue_at_to(self, queue_name, /, time_to_execute, func, *args, **kwargs):
         if isinstance(time_to_execute, datetime):
             execute_timestamp = time_to_execute.timestamp()
         else:
@@ -41,9 +50,9 @@ class JobQueue:
 
         now = time.time()
         if execute_timestamp <= now:
-            return self.enqueue(func, *args, **kwargs)
+            return self.enqueue_to(queue_name, func, *args, **kwargs)
 
-        job = self._new_job(func, *args, **kwargs)
+        job = self._new_job(queue_name, func, *args, **kwargs)
         job.status = JobStatus.SCHEDULED
         self._save_job(job)
         self.redis.sadd(self._status_key(JobStatus.SCHEDULED), job.id)
@@ -59,27 +68,27 @@ class JobQueue:
 
         return Job.deserialize(data)
 
-    def fetch_jobs(self, consumer_name: str, count: int = 1, block_ms: int = 2000):
+    def fetch_jobs(
+        self, consumer_name: str, count: int = 1, block_ms: int = 2000, queues=None
+    ):
         """
         Read messages from Redis Stream.
         Return list of tuple: [(message_id, job_id), ...]
         """
-        while(True):
-            messages = self.redis.xreadgroup(
-                self.GROUP, consumer_name, 
-                {self.STREAM: '>'}, count=count, block=block_ms
-            )
+        queues = queues or [self.DEFAULT_QUEUE]
+        streams = {}
+        for queue_name in queues:
+            self._create_consumer_group(queue_name)
+            streams[self._stream_for_queue(queue_name)] = ">"
 
-            if not messages:
-                print("No new messages. Waiting...")
-                return []
-
-            parsed_jobs = []
-            for _, entries in messages:
-                for message_id, data in entries:
-                    parsed_jobs.append((message_id, data["job_id"]))
-
-            return parsed_jobs
+        messages = self.redis.xreadgroup(
+            self.GROUP, consumer_name, streams, count=count, block=block_ms
+        )
+        return [
+            (message_id, data["job_id"], self._queue_for_stream(stream))
+            for stream, entries in messages
+            for message_id, data in entries
+        ]
 
     def retry_job(self, job, message_id, error=None, base_delay=10):
         attempts = job.attempts + 1
@@ -87,11 +96,9 @@ class JobQueue:
         job.error = error or "max retries exceeded"
 
         if attempts >= self.MAX_ATTEMPS:
-            job.status = JobStatus.DEAD_LETTER
-            self._save_job(job)
             self.update_status(job, JobStatus.DEAD_LETTER)
             self.dead_letter_queue.push(job.id, job.error, attempts)
-            self.ack(message_id)
+            self.ack(message_id, job.queue_name)
             print(f"Job {job.id} moved to DLQ")
             return
 
@@ -99,12 +106,10 @@ class JobQueue:
         delay_seconds = base_delay * (2 ** (attempts - 1))
         execute_at = time.time() + delay_seconds
 
-        job.status = JobStatus.RETRYING
-        self._save_job(job)
         self.update_status(job, JobStatus.RETRYING)
         # Saving delayed job into Redis ZSET.
         self.delayed_queue.push(job.id, execute_at)
-        self.ack(message_id)
+        self.ack(message_id, job.queue_name)
 
         print(f"Retry job={job.id}, attempt={attempts}")
 
@@ -119,12 +124,9 @@ class JobQueue:
             if job is None:
                 continue
 
-            job.status = JobStatus.QUEUED
-            self._save_job(job)
-            self.redis.srem(self._status_key(JobStatus.SCHEDULED), job_id)
-            self.redis.sadd(self._status_key(JobStatus.QUEUED), job_id)
+            self.update_status(job, JobStatus.QUEUED)
 
-            p.xadd(self.STREAM, {"job_id": job_id})
+            p.xadd(self._stream_for_queue(job.queue_name), {"job_id": job_id})
 
         p.execute()
         return len(ready_jobs)
@@ -138,26 +140,32 @@ class JobQueue:
                 jobs.append(job)
         return jobs
 
-    def reclaim_stale(self, consumer_name: str, min_idle_time=10000):
+    def reclaim_stale(self, consumer_name: str, min_idle_time=10000, queues=None):
         """
         Reclaim messages that have been pending
         for longer than min_idle_time milliseconds.
         """
-        result = self.redis.xautoclaim(
-            self.STREAM, self.GROUP, consumer_name,
-            min_idle_time, "0-0", count=10,
-        )
-        _, messages = result[0], result[1]
+        queues = queues or [self.DEFAULT_QUEUE]
+        reclaimed = []
+        for queue_name in queues:
+            self._create_consumer_group(queue_name)
+            result = self.redis.xautoclaim(
+                self._stream_for_queue(queue_name), self.GROUP, consumer_name,
+                min_idle_time, "0-0", count=10,
+            )
+            messages = result[1]
+            reclaimed.extend(
+                (message_id, data["job_id"], queue_name)
+                for message_id, data in messages
+            )
 
-        if not messages:
-            return []
-
-        print(f"Reclaimed {len(messages)} stale messages")
-        return [(message_id, data["job_id"]) for message_id, data in messages]
+        if reclaimed:
+            print(f"Reclaimed {len(reclaimed)} stale messages")
+        return reclaimed
    
-    def ack(self, message_id: str):
+    def ack(self, message_id: str, queue_name=DEFAULT_QUEUE):
         """Acknowledge that the worker has finished processing a message."""
-        self.redis.xack(self.STREAM, self.GROUP, message_id)
+        self.redis.xack(self._stream_for_queue(queue_name), self.GROUP, message_id)
 
     def update_status(self, job, new_status):
         old_status = job.status
@@ -170,23 +178,38 @@ class JobQueue:
         job.status = new_status
         self._save_job(job)
 
-    def _new_job(self, func, *args, **kwargs):
+    def _new_job(self, queue_name, /, func, *args, **kwargs):
         payload_data = {
             "func": func,
             "args": args,
             "kwargs": kwargs
         }
-        job = Job(id=str(uuid.uuid4()), payload=payload_data)
+        job = Job(id=str(uuid.uuid4()), payload=payload_data, queue_name=queue_name)
         return job
 
-    def _create_consumer_group(self):
+    def _create_consumer_group(self, queue_name):
         try:
             self.redis.xgroup_create(
-                self.STREAM, self.GROUP, id="0", mkstream=True,
+                self._stream_for_queue(queue_name), self.GROUP, id="0", mkstream=True,
             )
         except redis.exceptions.ResponseError as e:
             if "BUSYGROUP" not in str(e):
                 raise
+
+    def _stream_for_queue(self, queue_name):
+        if not queue_name or "," in queue_name:
+            raise ValueError("queue_name must be a non-empty queue name")
+        if queue_name == self.DEFAULT_QUEUE:
+            return self.STREAM
+        return f"{self.STREAM}:{queue_name}"
+
+    def _queue_for_stream(self, stream):
+        if isinstance(stream, bytes):
+            stream = stream.decode()
+        prefix = f"{self.STREAM}:"
+        if stream == self.STREAM:
+            return self.DEFAULT_QUEUE
+        return stream[len(prefix):]
 
     def _job_key(self, job_id):
         return f"{self.JOB_PREFIX}:{job_id}"

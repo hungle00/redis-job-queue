@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redis-job-queue"
+version = "0.1.0"
+description = "A lightweight Redis Streams job queue"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["redis", "cloudpickle"]
+
+[project.scripts]
+rqueue = "rqueue.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rqueue*"]

@@ -20,6 +20,7 @@ class Job:
     status: str = JobStatus.QUEUED
     attempts: int = 0
     error: Optional[str] = None
+    queue_name: str = "default"
 
     def to_dict(self):
         return asdict(self)
