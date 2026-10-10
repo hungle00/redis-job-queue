@@ -6,9 +6,12 @@ from concurrent.futures import ThreadPoolExecutor
 from rqueue.job_queue import JobQueue, JobStatus
 
 class Worker:
-    def __init__(self, queue: JobQueue, consumer_name: str, max_threads: int = 5):
+    def __init__(
+        self, queue: JobQueue, consumer_name: str, max_threads: int = 5, queues=None
+    ):
         self.queue = queue
         self.consumer = consumer_name
+        self.queues = queues or [queue.DEFAULT_QUEUE]
         self.is_running = True
         self.max_threads = max_threads
         self.executor = ThreadPoolExecutor(max_workers=max_threads, thread_name_prefix="JobWorker")
@@ -23,7 +26,7 @@ class Worker:
         self.executor.shutdown(wait=True)
 
     def start(self):
-        print(f"[Worker '{self.consumer}'] Start listening stream '{self.queue.STREAM}'...")
+        print(f"[Worker '{self.consumer}'] Listening on queues: {', '.join(self.queues)}")
         last_scheduler_check = 0
         last_reclaim_check = 0
 
@@ -41,10 +44,11 @@ class Worker:
                     last_reclaim_check = now
 
                 jobs_to_process = self.queue.fetch_jobs(
-                    self.consumer, count=self.max_threads, block_ms=2000
+                    self.consumer, count=self.max_threads, block_ms=2000,
+                    queues=self.queues,
                 )
-                for msg_id, job_id in jobs_to_process:
-                    self.executor.submit(self._process_message, msg_id, job_id)
+                for msg_id, job_id, queue_name in jobs_to_process:
+                    self.executor.submit(self._process_message, msg_id, job_id, queue_name)
 
             except redis.ConnectionError:
                 print("[Worker] Lost connection to Redis. Retrying in 5 seconds...")
@@ -55,18 +59,20 @@ class Worker:
                 break
 
     def _check_stale_jobs(self):
-        stale_jobs = self.queue.reclaim_stale(self.consumer, min_idle_time=30000)
+        stale_jobs = self.queue.reclaim_stale(
+            self.consumer, min_idle_time=30000, queues=self.queues
+        )
             
-        for msg_id, job_id in stale_jobs:
+        for msg_id, job_id, queue_name in stale_jobs:
             print(f"[Worker '{self.consumer}'] Reclaimed stale job: {job_id}")
-            self._process_message(msg_id, job_id)
+            self._process_message(msg_id, job_id, queue_name)
     
-    def _process_message(self, message_id: str, job_id: str):
+    def _process_message(self, message_id: str, job_id: str, queue_name: str):
         job = self.queue.get_job(job_id)
 
         if not job:
             print(f"Job {job_id} not found")
-            self.queue.ack(message_id)
+            self.queue.ack(message_id, queue_name)
             return
 
         self.queue.update_status(job, JobStatus.PROCESSING)
@@ -82,7 +88,7 @@ class Worker:
                 print(res)
 
                 self.queue.update_status(job, JobStatus.COMPLETED)
-                self.queue.ack(message_id)
+                self.queue.ack(message_id, queue_name)
                 print(f"[Child PID {os.getpid()}] completed job={job_id}")
                 os._exit(0)
 
